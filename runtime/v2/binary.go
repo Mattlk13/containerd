@@ -26,6 +26,7 @@ import (
 
 	"github.com/containerd/containerd/events/exchange"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/runtime"
 	client "github.com/containerd/containerd/runtime/v2/shim"
 	"github.com/containerd/containerd/runtime/v2/task"
@@ -57,7 +58,8 @@ type binary struct {
 
 func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ *shim, err error) {
 	args := []string{"-id", b.bundle.ID}
-	if logrus.GetLevel() == logrus.DebugLevel {
+	switch logrus.GetLevel() {
+	case logrus.DebugLevel, logrus.TraceLevel:
 		args = append(args, "-debug")
 	}
 	args = append(args, "start")
@@ -74,7 +76,15 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 	if err != nil {
 		return nil, err
 	}
-	f, err := openShimLog(ctx, b.bundle, client.AnonDialer)
+	// Windows needs a namespace when openShimLog
+	ns, _ := namespaces.Namespace(ctx)
+	shimCtx, cancelShimLog := context.WithCancel(namespaces.WithNamespace(context.Background(), ns))
+	defer func() {
+		if err != nil {
+			cancelShimLog()
+		}
+	}()
+	f, err := openShimLog(shimCtx, b.bundle, client.AnonDialer)
 	if err != nil {
 		return nil, errors.Wrap(err, "open shim log pipe")
 	}
@@ -89,6 +99,9 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 	go func() {
 		defer f.Close()
 		_, err := io.Copy(os.Stderr, f)
+		// To prevent flood of error messages, the expected error
+		// should be reset, like os.ErrClosed or os.ErrNotExist, which
+		// depends on platform.
 		err = checkCopyShimLogError(ctx, err)
 		if err != nil {
 			log.G(ctx).WithError(err).Error("copy shim log")
@@ -103,7 +116,12 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 	if err != nil {
 		return nil, err
 	}
-	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onClose))
+	onCloseWithShimLog := func() {
+		onClose()
+		cancelShimLog()
+		f.Close()
+	}
+	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onCloseWithShimLog))
 	return &shim{
 		bundle:  b.bundle,
 		client:  client,
@@ -116,11 +134,13 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_ 
 func (b *binary) Delete(ctx context.Context) (*runtime.Exit, error) {
 	log.G(ctx).Info("cleaning up dead shim")
 
-	// Windows cannot delete the current working directory while an
-	// executable is in use with it. For the cleanup case we invoke with the
-	// default work dir and forward the bundle path on the cmdline.
+	// On Windows and FreeBSD, the current working directory of the shim should
+	// not be the bundle path during the delete operation.  Instead, we invoke
+	// with the default work dir and forward the bundle path on the cmdline.
+	// Windows cannot delete the current working directory while an executable
+	// is in use with it. On FreeBSD, fork/exec can fail.
 	var bundlePath string
-	if gruntime.GOOS != "windows" {
+	if gruntime.GOOS != "windows" && gruntime.GOOS != "freebsd" {
 		bundlePath = b.bundle.Path
 	}
 
@@ -143,6 +163,7 @@ func (b *binary) Delete(ctx context.Context) (*runtime.Exit, error) {
 	cmd.Stdout = out
 	cmd.Stderr = errb
 	if err := cmd.Run(); err != nil {
+		log.G(ctx).WithField("cmd", cmd).WithError(err).Error("failed to delete")
 		return nil, errors.Wrapf(err, "%s", errb.String())
 	}
 	s := errb.String()

@@ -23,6 +23,7 @@ import (
 
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/pkg/testutil"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -223,8 +224,38 @@ func TestWithCapabilitiesNil(t *testing.T) {
 	}
 }
 
+func TestPopulateDefaultWindowsSpec(t *testing.T) {
+	var (
+		c   = containers.Container{ID: "TestWithDefaultSpec"}
+		ctx = namespaces.WithNamespace(context.Background(), "test")
+	)
+	var expected Spec
+
+	populateDefaultWindowsSpec(ctx, &expected, c.ID)
+	if expected.Windows == nil {
+		t.Error("Cannot populate windows Spec")
+	}
+}
+
+func TestPopulateDefaultUnixSpec(t *testing.T) {
+	var (
+		c   = containers.Container{ID: "TestWithDefaultSpec"}
+		ctx = namespaces.WithNamespace(context.Background(), "test")
+	)
+	var expected Spec
+
+	populateDefaultUnixSpec(ctx, &expected, c.ID)
+	if expected.Linux == nil {
+		t.Error("Cannot populate Unix Spec")
+	}
+}
+
 func TestWithPrivileged(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "linux" {
+		// because WithPrivileged depends on CapEff in /proc/self/status
+		testutil.RequiresRoot(t)
+	}
 
 	ctx := namespaces.WithNamespace(context.Background(), "testing")
 
@@ -244,6 +275,10 @@ func TestWithPrivileged(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if runtime.GOOS != "linux" {
+		return
 	}
 
 	if len(s.Process.Capabilities.Bounding) == 0 {

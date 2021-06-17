@@ -36,7 +36,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"gotest.tools/assert"
+	"gotest.tools/v3/assert"
 )
 
 const (
@@ -780,6 +780,7 @@ func checkSmallBlob(ctx context.Context, t *testing.T, store content.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer ra.Close()
 	r := io.NewSectionReader(ra, 0, readSize)
 	b, err := ioutil.ReadAll(r)
 	if err != nil {

@@ -20,10 +20,23 @@
 #
 set -eu -o pipefail
 
+script_dir="$(cd -- "$(dirname -- "$0")" > /dev/null 2>&1; pwd -P)"
+
+cd "$GOPATH"
 go get -u github.com/onsi/ginkgo/ginkgo
-CRITEST_COMMIT=427262054f59f3b849391310856a19474acb7e83
-go get -d github.com/kubernetes-incubator/cri-tools/...
-cd $GOPATH/src/github.com/kubernetes-incubator/cri-tools
-git checkout $CRITEST_COMMIT
+
+: "${CRITEST_COMMIT:=$(cat "${script_dir}/critools-version")}"
+
+TMPROOT=$(mktemp -d)
+git clone https://github.com/kubernetes-sigs/cri-tools.git "${TMPROOT}"/cri-tools
+pushd "${TMPROOT}"/cri-tools
+git checkout "$CRITEST_COMMIT"
 make
-make install
+make install -e DESTDIR=${DESTDIR:=''} BINDIR=/usr/local/bin
+
+cat << EOF | tee ${DESTDIR:=''}/etc/crictl.yaml
+runtime-endpoint: unix:///run/containerd/containerd.sock
+EOF
+
+popd
+rm -fR "${TMPROOT}"

@@ -1,4 +1,4 @@
-// +build linux,!no_btrfs
+// +build linux,!no_btrfs,cgo
 
 /*
    Copyright The containerd Authors.
@@ -19,6 +19,7 @@
 package btrfs
 
 import (
+	"bytes"
 	"context"
 	"io/ioutil"
 	"os"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/testutil"
+	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/testsuite"
 	"github.com/containerd/continuity/testutil/loopback"
@@ -43,7 +45,10 @@ func boltSnapshotter(t *testing.T) func(context.Context, string) (snapshots.Snap
 		t.Skipf("could not find mkfs.btrfs: %v", err)
 	}
 
-	// TODO: Check for btrfs in /proc/module and skip if not loaded
+	procModules, err := ioutil.ReadFile("/proc/modules")
+	if err == nil && !bytes.Contains(procModules, []byte("btrfs")) {
+		t.Skip("check for btrfs kernel module failed, skipping test")
+	}
 
 	return func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
 
@@ -66,27 +71,31 @@ func boltSnapshotter(t *testing.T) func(context.Context, string) (snapshots.Snap
 		// sync after a mkfs on the loopback before trying to mount the device
 		unix.Sync()
 
+		var snapshotter snapshots.Snapshotter
 		for i := 0; i < 5; i++ {
 			if out, err := exec.Command("mount", loop.Device, root).CombinedOutput(); err != nil {
 				loop.Close()
 				return nil, nil, errors.Wrapf(err, "failed to mount device %s (out: %q)", loop.Device, out)
 			}
-			var stat unix.Statfs_t
-			if err := unix.Statfs(root, &stat); err != nil {
-				unix.Unmount(root, 0)
-				return nil, nil, errors.Wrapf(err, "unable to statfs btrfs mount %s", root)
+
+			if i > 0 {
+				time.Sleep(10 * time.Duration(i) * time.Millisecond)
 			}
-			if stat.Type == unix.BTRFS_SUPER_MAGIC {
+
+			snapshotter, err = NewSnapshotter(root)
+			if err == nil {
 				break
+			} else if !errors.Is(err, plugin.ErrSkipPlugin) {
+				return nil, nil, err
 			}
+
+			t.Logf("Attempt %d to create btrfs snapshotter failed: %#v", i+1, err)
+
 			// unmount and try again
 			unix.Unmount(root, 0)
-			time.Sleep(100 * time.Millisecond)
 		}
-		snapshotter, err := NewSnapshotter(root)
-		if err != nil {
-			loop.Close()
-			return nil, nil, errors.Wrap(err, "failed to create new snapshotter")
+		if snapshotter == nil {
+			return nil, nil, errors.Wrap(err, "failed to successfully create snapshotter after 5 attempts")
 		}
 
 		return snapshotter, func() error {

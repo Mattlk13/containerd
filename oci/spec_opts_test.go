@@ -25,6 +25,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -36,7 +37,7 @@ import (
 
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 type blob []byte
@@ -157,6 +158,67 @@ func TestReplaceOrAppendEnvValues(t *testing.T) {
 	if err := assertEqualsStringArrays(results, expected); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWithDefaultSpecForPlatform(t *testing.T) {
+	t.Parallel()
+	var (
+		s   Spec
+		c   = containers.Container{ID: "TestWithDefaultSpecForPlatform"}
+		ctx = namespaces.WithNamespace(context.Background(), "test")
+	)
+
+	platforms := []string{"linux/amd64", "windows/amd64"}
+	for _, p := range platforms {
+		if err := ApplyOpts(ctx, nil, &c, &s, WithDefaultSpecForPlatform(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+}
+
+func Contains(a []string, x string) bool {
+	for _, n := range a {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWithDefaultPathEnv(t *testing.T) {
+	t.Parallel()
+	s := Spec{}
+	s.Process = &specs.Process{
+		Env: []string{},
+	}
+	var (
+		defaultUnixEnv = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+		ctx            = namespaces.WithNamespace(context.Background(), "test")
+	)
+	WithDefaultPathEnv(ctx, nil, nil, &s)
+	if !Contains(s.Process.Env, defaultUnixEnv) {
+		t.Fatal("default Unix Env not found")
+	}
+}
+
+func TestWithProcessCwd(t *testing.T) {
+	t.Parallel()
+	s := Spec{}
+	opts := []SpecOpts{
+		WithProcessCwd("testCwd"),
+	}
+	var expectedCwd = "testCwd"
+
+	for _, opt := range opts {
+		if err := opt(nil, nil, nil, &s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.Process.Cwd != expectedCwd {
+		t.Fatal("Process has a wrong current working directory")
+	}
+
 }
 
 func TestWithEnv(t *testing.T) {
@@ -381,6 +443,70 @@ func assertEqualsStringArrays(values, expected []string) error {
 	return nil
 }
 
+func TestWithTTYSize(t *testing.T) {
+	t.Parallel()
+	s := Spec{}
+	opts := []SpecOpts{
+		WithTTYSize(10, 20),
+	}
+	var (
+		expectedWidth  = uint(10)
+		expectedHeight = uint(20)
+	)
+
+	for _, opt := range opts {
+		if err := opt(nil, nil, nil, &s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.Process.ConsoleSize.Height != expectedWidth && s.Process.ConsoleSize.Height != expectedHeight {
+		t.Fatal("Process Console has invalid size")
+	}
+
+}
+
+func TestWithUserNamespace(t *testing.T) {
+	t.Parallel()
+	s := Spec{}
+
+	opts := []SpecOpts{
+		WithUserNamespace([]specs.LinuxIDMapping{
+			{
+				ContainerID: 1,
+				HostID:      2,
+				Size:        10000,
+			},
+		}, []specs.LinuxIDMapping{
+			{
+				ContainerID: 2,
+				HostID:      3,
+				Size:        20000,
+			},
+		}),
+	}
+
+	for _, opt := range opts {
+		if err := opt(nil, nil, nil, &s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	expectedUIDMapping := specs.LinuxIDMapping{
+		ContainerID: 1,
+		HostID:      2,
+		Size:        10000,
+	}
+	expectedGIDMapping := specs.LinuxIDMapping{
+		ContainerID: 2,
+		HostID:      3,
+		Size:        20000,
+	}
+
+	if !(len(s.Linux.UIDMappings) == 1 && s.Linux.UIDMappings[0] == expectedUIDMapping) || !(len(s.Linux.GIDMappings) == 1 && s.Linux.GIDMappings[0] == expectedGIDMapping) {
+		t.Fatal("WithUserNamespace Cannot set the uid/gid mappings for the task")
+	}
+
+}
 func TestWithImageConfigArgs(t *testing.T) {
 	t.Parallel()
 
@@ -424,139 +550,158 @@ func TestWithImageConfigArgs(t *testing.T) {
 	}
 }
 
-func TestAddCaps(t *testing.T) {
-	t.Parallel()
-
-	var s specs.Spec
-
-	if err := WithAddedCapabilities([]string{"CAP_CHOWN"})(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-	for i, cl := range [][]string{
-		s.Process.Capabilities.Bounding,
-		s.Process.Capabilities.Effective,
-		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
-	} {
-		if !capsContain(cl, "CAP_CHOWN") {
-			t.Errorf("cap list %d does not contain added cap", i)
-		}
-	}
-}
-
-func TestDropCaps(t *testing.T) {
-	t.Parallel()
-
-	var s specs.Spec
-
-	if err := WithAllCapabilities(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-	if err := WithDroppedCapabilities([]string{"CAP_CHOWN"})(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-
-	for i, cl := range [][]string{
-		s.Process.Capabilities.Bounding,
-		s.Process.Capabilities.Effective,
-		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
-	} {
-		if capsContain(cl, "CAP_CHOWN") {
-			t.Errorf("cap list %d contains dropped cap", i)
-		}
-	}
-
-	// Add all capabilities back and drop a different cap.
-	if err := WithAllCapabilities(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-	if err := WithDroppedCapabilities([]string{"CAP_FOWNER"})(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-
-	for i, cl := range [][]string{
-		s.Process.Capabilities.Bounding,
-		s.Process.Capabilities.Effective,
-		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
-	} {
-		if capsContain(cl, "CAP_FOWNER") {
-			t.Errorf("cap list %d contains dropped cap", i)
-		}
-		if !capsContain(cl, "CAP_CHOWN") {
-			t.Errorf("cap list %d doesn't contain non-dropped cap", i)
-		}
-	}
-
-	// Drop all duplicated caps.
-	if err := WithCapabilities([]string{"CAP_CHOWN", "CAP_CHOWN"})(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-	if err := WithDroppedCapabilities([]string{"CAP_CHOWN"})(context.Background(), nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-	for i, cl := range [][]string{
-		s.Process.Capabilities.Bounding,
-		s.Process.Capabilities.Effective,
-		s.Process.Capabilities.Permitted,
-		s.Process.Capabilities.Inheritable,
-	} {
-		if len(cl) != 0 {
-			t.Errorf("cap list %d is not empty", i)
-		}
-	}
-}
-
 func TestDevShmSize(t *testing.T) {
 	t.Parallel()
-	var (
-		s   Spec
-		c   = containers.Container{ID: t.Name()}
-		ctx = namespaces.WithNamespace(context.Background(), "test")
-	)
 
-	err := populateDefaultUnixSpec(ctx, &s, c.ID)
-	if err != nil {
-		t.Fatal(err)
+	ss := []Spec{
+		{
+			Mounts: []specs.Mount{
+				{
+					Destination: "/dev/shm",
+					Type:        "tmpfs",
+					Source:      "shm",
+					Options:     []string{"nosuid", "noexec", "nodev", "mode=1777"},
+				},
+			},
+		},
+		{
+			Mounts: []specs.Mount{
+				{
+					Destination: "/test/shm",
+					Type:        "tmpfs",
+					Source:      "shm",
+					Options:     []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"},
+				},
+			},
+		},
+		{
+			Mounts: []specs.Mount{
+				{
+					Destination: "/test/shm",
+					Type:        "tmpfs",
+					Source:      "shm",
+					Options:     []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"},
+				},
+				{
+					Destination: "/dev/shm",
+					Type:        "tmpfs",
+					Source:      "shm",
+					Options:     []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k", "size=131072k"},
+				},
+			},
+		},
 	}
 
 	expected := "1024k"
-	if err := WithDevShmSize(1024)(nil, nil, nil, &s); err != nil {
-		t.Fatal(err)
-	}
-	m := getShmMount(&s)
-	if m == nil {
-		t.Fatal("no shm mount found")
-	}
-	o := getShmSize(m.Options)
-	if o == "" {
-		t.Fatal("shm size not specified")
-	}
-	parts := strings.Split(o, "=")
-	if len(parts) != 2 {
-		t.Fatal("invalid size format")
-	}
-	size := parts[1]
-	if size != expected {
-		t.Fatalf("size %s not equal %s", size, expected)
+	for _, s := range ss {
+		if err := WithDevShmSize(1024)(nil, nil, nil, &s); err != nil {
+			if err != ErrNoShmMount {
+				t.Fatal(err)
+			}
+
+			if getDevShmMount(&s) == nil {
+				continue
+			}
+			t.Fatal("excepted nil /dev/shm mount")
+		}
+
+		m := getDevShmMount(&s)
+		if m == nil {
+			t.Fatal("no shm mount found")
+		}
+		size, err := getShmSize(m.Options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if size != expected {
+			t.Fatalf("size %s not equal %s", size, expected)
+		}
 	}
 }
 
-func getShmMount(s *Spec) *specs.Mount {
+func getDevShmMount(s *Spec) *specs.Mount {
 	for _, m := range s.Mounts {
-		if m.Source == "shm" && m.Type == "tmpfs" {
+		if filepath.Clean(m.Destination) == "/dev/shm" && m.Source == "shm" && m.Type == "tmpfs" {
 			return &m
 		}
 	}
 	return nil
 }
 
-func getShmSize(opts []string) string {
+func getShmSize(opts []string) (string, error) {
+	// linux will use the last size option
+	var so string
 	for _, o := range opts {
 		if strings.HasPrefix(o, "size=") {
-			return o
+			if so != "" {
+				return "", errors.New("contains multiple size options")
+			}
+			so = o
 		}
 	}
-	return ""
+	if so == "" {
+		return "", errors.New("shm size not specified")
+	}
+
+	parts := strings.Split(so, "=")
+	if len(parts) != 2 {
+		return "", errors.New("invalid size format")
+	}
+	return parts[1], nil
+}
+
+func TestWithoutMounts(t *testing.T) {
+	t.Parallel()
+	var s Spec
+
+	x := func(s string) string {
+		if runtime.GOOS == "windows" {
+			return filepath.Join("C:\\", filepath.Clean(s))
+		}
+		return s
+	}
+	opts := []SpecOpts{
+		WithMounts([]specs.Mount{
+			{
+				Destination: x("/dst1"),
+				Source:      x("/src1"),
+			},
+			{
+				Destination: x("/dst2"),
+				Source:      x("/src2"),
+			},
+			{
+				Destination: x("/dst3"),
+				Source:      x("/src3"),
+			},
+		}),
+		WithoutMounts(x("/dst2"), x("/dst3")),
+		WithMounts([]specs.Mount{
+			{
+				Destination: x("/dst4"),
+				Source:      x("/src4"),
+			},
+		}),
+	}
+
+	expected := []specs.Mount{
+		{
+			Destination: x("/dst1"),
+			Source:      x("/src1"),
+		},
+		{
+			Destination: x("/dst4"),
+			Source:      x("/src4"),
+		},
+	}
+
+	for _, opt := range opts {
+		if err := opt(nil, nil, nil, &s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if !reflect.DeepEqual(expected, s.Mounts) {
+		t.Fatalf("expected %+v, got %+v", expected, s.Mounts)
+	}
 }

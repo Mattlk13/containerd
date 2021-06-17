@@ -118,6 +118,13 @@ func initFunc(ic *plugin.InitContext) (interface{}, error) {
 			l.monitor.Monitor(t)
 		}
 	}
+	v2Tasks, err := l.v2Runtime.Tasks(ic.Context, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range v2Tasks {
+		l.monitor.Monitor(t)
+	}
 	return l, nil
 }
 
@@ -141,7 +148,7 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 		return nil, err
 	}
 	// jump get checkpointPath from checkpoint image
-	if checkpointPath != "" && r.Checkpoint != nil {
+	if checkpointPath == "" && r.Checkpoint != nil {
 		checkpointPath, err = ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "ctrd-checkpoint")
 		if err != nil {
 			return nil, err
@@ -183,6 +190,11 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 			Source:  m.Source,
 			Options: m.Options,
 		})
+	}
+	if strings.HasPrefix(container.Runtime.Name, "io.containerd.runtime.v1.") {
+		log.G(ctx).Warn("runtime v1 is deprecated since containerd v1.4, consider using runtime v2")
+	} else if container.Runtime.Name == plugin.RuntimeRuncV1 {
+		log.G(ctx).Warnf("%q is deprecated since containerd v1.4, consider using %q", plugin.RuntimeRuncV1, plugin.RuntimeRuncV2)
 	}
 	rtime, err := l.getRuntime(container.Runtime.Name)
 	if err != nil {
@@ -241,7 +253,7 @@ func (l *local) Delete(ctx context.Context, r *api.DeleteTaskRequest, _ ...grpc.
 	}
 	exit, err := t.Delete(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errdefs.ToGRPC(err)
 	}
 	return &api.DeleteResponse{
 		ExitStatus: exit.Status,
@@ -257,7 +269,7 @@ func (l *local) DeleteProcess(ctx context.Context, r *api.DeleteProcessRequest, 
 	}
 	process, err := t.Process(ctx, r.ExecID)
 	if err != nil {
-		return nil, err
+		return nil, errdefs.ToGRPC(err)
 	}
 	exit, err := process.Delete(ctx)
 	if err != nil {
@@ -548,7 +560,7 @@ func (l *local) Update(ctx context.Context, r *api.UpdateTaskRequest, _ ...grpc.
 	if err != nil {
 		return nil, err
 	}
-	if err := t.Update(ctx, r.Resources); err != nil {
+	if err := t.Update(ctx, r.Resources, r.Annotations); err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
 	return empty, nil

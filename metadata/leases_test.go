@@ -17,6 +17,7 @@
 package metadata
 
 import (
+	_ "crypto/sha256"
 	"testing"
 
 	"github.com/containerd/containerd/errdefs"
@@ -55,7 +56,7 @@ func TestLeases(t *testing.T) {
 		if err := db.Update(func(tx *bolt.Tx) error {
 			lease, err := lm.Create(WithTransactionContext(ctx, tx), leases.WithID(tc.ID))
 			if err != nil {
-				if tc.CreateErr != nil && errors.Cause(err) == tc.CreateErr {
+				if tc.CreateErr != nil && errors.Is(err, tc.CreateErr) {
 					return nil
 				}
 				return err
@@ -88,7 +89,7 @@ func TestLeases(t *testing.T) {
 		if err := lm.Delete(ctx, leases.Lease{
 			ID: tc.ID,
 		}); err != nil {
-			if tc.DeleteErr == nil && errors.Cause(err) != tc.DeleteErr {
+			if tc.DeleteErr == nil && !errors.Is(err, tc.DeleteErr) {
 				t.Fatal(err)
 			}
 
@@ -363,7 +364,7 @@ func TestLeaseResource(t *testing.T) {
 	for i, tc := range testCases {
 		if err := db.Update(func(tx *bolt.Tx) error {
 			err0 := lm.AddResource(WithTransactionContext(ctx, tx), tc.lease, tc.resource)
-			if got := errors.Cause(err0); got != tc.err {
+			if !errors.Is(err0, tc.err) {
 				return errors.Errorf("expect error (%v), but got (%v)", tc.err, err0)
 			}
 

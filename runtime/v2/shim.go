@@ -76,9 +76,15 @@ func loadShim(ctx context.Context, bundle *Bundle, events *exchange.Exchange, rt
 			conn.Close()
 		}
 	}()
-	f, err := openShimLog(ctx, bundle, client.AnonReconnectDialer)
+	shimCtx, cancelShimLog := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			cancelShimLog()
+		}
+	}()
+	f, err := openShimLog(shimCtx, bundle, client.AnonReconnectDialer)
 	if err != nil {
-		return nil, errors.Wrap(err, "open shim log pipe")
+		return nil, errors.Wrap(err, "open shim log pipe when reload")
 	}
 	defer func() {
 		if err != nil {
@@ -90,17 +96,21 @@ func loadShim(ctx context.Context, bundle *Bundle, events *exchange.Exchange, rt
 	// copy the shim's logs to containerd's output
 	go func() {
 		defer f.Close()
-		if _, err := io.Copy(os.Stderr, f); err != nil {
-			// When using a multi-container shim the 2nd to Nth container in the
-			// shim will not have a separate log pipe. Ignore the failure log
-			// message here when the shim connect times out.
-			if !os.IsNotExist(errors.Cause(err)) {
-				log.G(ctx).WithError(err).Error("copy shim log")
-			}
+		_, err := io.Copy(os.Stderr, f)
+		// To prevent flood of error messages, the expected error
+		// should be reset, like os.ErrClosed or os.ErrNotExist, which
+		// depends on platform.
+		err = checkCopyShimLogError(ctx, err)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("copy shim log after reload")
 		}
 	}()
-
-	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onClose))
+	onCloseWithShimLog := func() {
+		onClose()
+		cancelShimLog()
+		f.Close()
+	}
+	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onCloseWithShimLog))
 	defer func() {
 		if err != nil {
 			client.Close()
@@ -121,7 +131,7 @@ func loadShim(ctx context.Context, bundle *Bundle, events *exchange.Exchange, rt
 	return s, nil
 }
 
-func cleanupAfterDeadShim(ctx context.Context, id, ns string, events *exchange.Exchange, binaryCall *binary) {
+func cleanupAfterDeadShim(ctx context.Context, id, ns string, rt *runtime.TaskList, events *exchange.Exchange, binaryCall *binary) {
 	ctx = namespaces.WithNamespace(ctx, ns)
 	ctx, cancel := timeout.WithContext(ctx, cleanupTimeout)
 	defer cancel()
@@ -136,6 +146,12 @@ func cleanupAfterDeadShim(ctx context.Context, id, ns string, events *exchange.E
 			"id":        id,
 			"namespace": ns,
 		}).Warn("failed to clean up after shim disconnected")
+	}
+
+	if _, err := rt.Get(ctx, id); err != nil {
+		// Task was never started or was already successfully deleted
+		// No need to publish events
+		return
 	}
 
 	var (
@@ -191,7 +207,7 @@ func (s *shim) Shutdown(ctx context.Context) error {
 	_, err := s.task.Shutdown(ctx, &task.ShutdownRequest{
 		ID: s.ID(),
 	})
-	if err != nil && errors.Cause(err) != ttrpc.ErrClosed {
+	if err != nil && !errors.Is(err, ttrpc.ErrClosed) {
 		return errdefs.FromGRPC(err)
 	}
 	return nil
@@ -222,21 +238,47 @@ func (s *shim) Close() error {
 }
 
 func (s *shim) Delete(ctx context.Context) (*runtime.Exit, error) {
-	response, err := s.task.Delete(ctx, &task.DeleteRequest{
+	response, shimErr := s.task.Delete(ctx, &task.DeleteRequest{
 		ID: s.ID(),
 	})
-	if err != nil && !errdefs.IsNotFound(err) {
-		return nil, errdefs.FromGRPC(err)
+	if shimErr != nil {
+		log.G(ctx).WithField("id", s.ID()).WithError(shimErr).Debug("failed to delete task")
+		if !errors.Is(shimErr, ttrpc.ErrClosed) {
+			shimErr = errdefs.FromGRPC(shimErr)
+			if !errdefs.IsNotFound(shimErr) {
+				return nil, shimErr
+			}
+		}
 	}
+
+	// NOTE: If the shim has been killed and ttrpc connection has been
+	// closed, the shimErr will not be nil. For this case, the event
+	// subscriber, like moby/moby, might have received the exit or delete
+	// events. Just in case, we should allow ttrpc-callback-on-close to
+	// send the exit and delete events again. And the exit status will
+	// depend on result of shimV2.Delete.
+	//
+	// If not, the shim has been delivered the exit and delete events.
+	// So we should remove the record and prevent duplicate events from
+	// ttrpc-callback-on-close.
+	if shimErr == nil {
+		s.rtTasks.Delete(ctx, s.ID())
+	}
+
+	if err := s.waitShutdown(ctx); err != nil {
+		log.G(ctx).WithField("id", s.ID()).WithError(err).Error("failed to shutdown shim")
+	}
+	s.Close()
+	s.client.UserOnCloseWait(ctx)
+
 	// remove self from the runtime task list
 	// this seems dirty but it cleans up the API across runtimes, tasks, and the service
 	s.rtTasks.Delete(ctx, s.ID())
-	if err := s.waitShutdown(ctx); err != nil {
-		log.G(ctx).WithError(err).Error("failed to shutdown shim")
-	}
-	s.Close()
 	if err := s.bundle.Delete(); err != nil {
-		log.G(ctx).WithError(err).Error("failed to delete bundle")
+		log.G(ctx).WithField("id", s.ID()).WithError(err).Error("failed to delete bundle")
+	}
+	if shimErr != nil {
+		return nil, shimErr
 	}
 	return &runtime.Exit{
 		Status:    response.ExitStatus,
@@ -403,10 +445,11 @@ func (s *shim) Checkpoint(ctx context.Context, path string, options *ptypes.Any)
 	return nil
 }
 
-func (s *shim) Update(ctx context.Context, resources *ptypes.Any) error {
+func (s *shim) Update(ctx context.Context, resources *ptypes.Any, annotations map[string]string) error {
 	if _, err := s.task.Update(ctx, &task.UpdateTaskRequest{
-		ID:        s.ID(),
-		Resources: resources,
+		ID:          s.ID(),
+		Resources:   resources,
+		Annotations: annotations,
 	}); err != nil {
 		return errdefs.FromGRPC(err)
 	}
@@ -424,10 +467,14 @@ func (s *shim) Stats(ctx context.Context) (*ptypes.Any, error) {
 }
 
 func (s *shim) Process(ctx context.Context, id string) (runtime.Process, error) {
-	return &process{
+	p := &process{
 		id:   id,
 		shim: s,
-	}, nil
+	}
+	if _, err := p.State(ctx); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 func (s *shim) State(ctx context.Context) (runtime.State, error) {
@@ -435,7 +482,7 @@ func (s *shim) State(ctx context.Context) (runtime.State, error) {
 		ID: s.ID(),
 	})
 	if err != nil {
-		if errors.Cause(err) != ttrpc.ErrClosed {
+		if !errors.Is(err, ttrpc.ErrClosed) {
 			return runtime.State{}, errdefs.FromGRPC(err)
 		}
 		return runtime.State{}, errdefs.ErrNotFound
